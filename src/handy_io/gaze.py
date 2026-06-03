@@ -29,8 +29,32 @@ from .landmarks import GazeLandmarks
 
 # ── assumed average inter-pupillary distance (metres) ────────────────────────
 _IPD_METRES = 0.063
-# ── assumed camera focal length (pixels) — typical webcam at 1280 px wide ───
-_FOCAL_PX = 800.0
+# ── camera focal length resolved at runtime from actual FOV ──────────────────
+# Filled in by _get_focal_px(); falls back to 800 if the camera reports no FOV.
+_FOCAL_PX: float | None = None
+
+
+def _get_focal_px(cap=None) -> float:
+    """
+    Estimate focal length in pixels from the camera's actual frame width and
+    an assumed 60° horizontal FOV (typical for built-in webcams).
+    Formula: f = (image_width / 2) / tan(HFOV / 2)
+    """
+    import math
+    import cv2 as _cv2
+    width = cap.get(_cv2.CAP_PROP_FRAME_WIDTH) if cap is not None else 1280.0
+    if width <= 0:
+        width = 1280.0
+    hfov_deg = 60.0  # conservative default; override HFOV_DEG if you know yours
+    return (width / 2.0) / math.tan(math.radians(hfov_deg / 2.0))
+
+
+def init_focal_px(cap=None) -> float:
+    """Call once after opening the camera to set the module-level focal length."""
+    global _FOCAL_PX
+    _FOCAL_PX = _get_focal_px(cap)
+    print(f"[gaze] focal length set to {_FOCAL_PX:.1f} px")
+    return _FOCAL_PX
 
 # ── left/right eye corner indices inside GazeLandmarks arrays ────────────────
 _OUTER, _INNER = 0, 1
@@ -95,7 +119,8 @@ def _estimate_distance_m(gl: GazeLandmarks) -> float:
     ipd_px = np.linalg.norm(right_px - left_px)
     if ipd_px < 5:
         return 0.65
-    return _FOCAL_PX * _IPD_METRES / ipd_px
+    focal = _FOCAL_PX if _FOCAL_PX is not None else 800.0
+    return focal * _IPD_METRES / ipd_px
 
 
 def _gaze_ray_head_compensated(gl: GazeLandmarks) -> np.ndarray:

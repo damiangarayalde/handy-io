@@ -17,6 +17,12 @@ import cv2
 import numpy as np
 from typing import Callable
 
+# ── polynomial degree used for the calibration fit ───────────────────────────
+# Degree 1 = linear (original behaviour).
+# Degree 2 = adds x², xy, y² terms — handles pin-cushion / barrel distortion
+#            that linear regression cannot model.
+POLY_DEGREE = 2
+
 
 # ── tunables ─────────────────────────────────────────────────────────────────
 DWELL_FRAMES     = 30    # frames of stable gaze before auto-capture triggers
@@ -170,17 +176,44 @@ class Calibrator:
             self._done = True
 
     def _fit(self) -> None:
-        A      = np.stack(self._samples)
-        b      = np.stack(self._targets)
-        A_bias = np.hstack([A, np.ones((len(A), 1))])
-        sol_x, _, _, _ = np.linalg.lstsq(A_bias, b[:, 0], rcond=None)
-        sol_y, _, _, _ = np.linalg.lstsq(A_bias, b[:, 1], rcond=None)
+        A = np.stack(self._samples)
+        b = np.stack(self._targets)
+        A_poly = _poly_expand(A, POLY_DEGREE)
+        sol_x, _, _, _ = np.linalg.lstsq(A_poly, b[:, 0], rcond=None)
+        sol_y, _, _, _ = np.linalg.lstsq(A_poly, b[:, 1], rcond=None)
+        # Store as (2, n_terms) matrix alongside the degree so apply() can match it.
         self.matrix = np.vstack([sol_x, sol_y])
+        self.poly_degree = POLY_DEGREE
         print(f"[calibration] fit complete — {len(self._samples)} points, "
-              f"matrix {self.matrix.shape}")
+              f"degree={POLY_DEGREE}, matrix {self.matrix.shape}")
 
 
-def apply(features: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Map feature vector → normalised screen (x, y) via calibration matrix."""
-    feat_bias = np.append(features, 1.0)
-    return np.clip(matrix @ feat_bias, 0.0, 1.0)
+def _poly_expand(X: np.ndarray, degree: int) -> np.ndarray:
+    """
+    Expand each row of X into a polynomial feature vector with bias.
+
+    For a 4-element input [a, b, c, d] at degree 2 this adds all pairwise
+    products (a*b, a*c, … d*d) and a bias column, giving the regressor enough
+    expressiveness to fit pin-cushion / barrel gaze distortion.
+    """
+    from itertools import combinations_with_replacement
+    n, m = X.shape
+    cols = [np.ones(n)]                    # bias
+    # degree-1 terms
+    for i in range(m):
+        cols.append(X[:, i])
+    # higher-degree terms
+    for d in range(2, degree + 1):
+        for combo in combinations_with_replacement(range(m), d):
+            term = np.ones(n)
+            for idx in combo:
+                term = term * X[:, idx]
+            cols.append(term)
+    return np.column_stack(cols)
+
+
+def apply(features: np.ndarray, matrix: np.ndarray, poly_degree: int = POLY_DEGREE) -> np.ndarray:
+    """Map feature vector → normalised screen (x, y) via polynomial calibration matrix."""
+    feat_row = _poly_expand(features.reshape(1, -1), poly_degree)   # (1, n_terms)
+    raw = matrix @ feat_row[0]                                       # (2,)
+    return np.clip(raw, 0.0, 1.0)
