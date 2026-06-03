@@ -243,6 +243,80 @@ def draw_hands(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
 
+@dataclass
+class PinchTransform:
+    """Square transform derived from the right hand's thumb–index pinch."""
+    cx: int          # screen x of midpoint
+    cy: int          # screen y of midpoint
+    size: int        # side length in pixels
+    angle_deg: float # rotation in degrees (XY plane angle of thumb→index axis)
+
+
+def pinch_transform(
+    hands_result: HandsResult,
+    screen_w: int,
+    screen_h: int,
+    *,
+    min_frac: float = 0.1,
+    max_frac: float = 0.8,
+    max_dist: float = 0.35,
+    mirror_x: bool = True,
+) -> PinchTransform | None:
+    """
+    Derive translation, rotation, and size for the pinch square from the right
+    hand's thumb-tip (4) and index-tip (8):
+      - size     : 3D distance mapped to [min_frac*sh, max_frac*sh]
+      - position : midpoint of the two tips in screen pixels
+      - rotation : XY-plane angle of the thumb→index vector (degrees)
+    Returns None when no right hand is detected.
+    """
+    for hand in hands_result.hands:
+        if hand.handedness != "Right":
+            continue
+        thumb = hand.landmarks[THUMB_TIP]
+        index = hand.landmarks[INDEX_TIP]
+
+        dist = float(np.linalg.norm(thumb - index))
+        t = np.clip(dist / max_dist, 0.0, 1.0)
+        size = int(min_frac * screen_h + t * (max_frac - min_frac) * screen_h)
+
+        mid = (thumb + index) / 2.0
+        mx = mid[0] if not mirror_x else 1.0 - mid[0]
+        cx = int(np.clip(mx,    0.0, 1.0) * screen_w)
+        cy = int(np.clip(mid[1], 0.0, 1.0) * screen_h)
+
+        # Angle of the thumb→index vector in the XY plane.
+        # Mirror flips x so we negate dx accordingly.
+        dx = index[0] - thumb[0]
+        if mirror_x:
+            dx = -dx
+        dy = index[1] - thumb[1]
+        angle_deg = float(np.degrees(np.arctan2(dy, dx)))
+
+        return PinchTransform(cx=cx, cy=cy, size=size, angle_deg=angle_deg)
+    return None
+
+
+def draw_pinch_square(frame: np.ndarray, pt: PinchTransform) -> None:
+    """Draw a rotated, translated square described by *pt* onto *frame* (BGR, in-place)."""
+    half = pt.size // 2
+    corners = np.array([
+        [-half, -half],
+        [ half, -half],
+        [ half,  half],
+        [-half,  half],
+    ], dtype=np.float32)
+
+    rad = np.radians(pt.angle_deg)
+    cos_a, sin_a = np.cos(rad), np.sin(rad)
+    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+
+    rotated = (rot @ corners.T).T + np.array([pt.cx, pt.cy], dtype=np.float32)
+    pts = rotated.astype(np.int32).reshape((-1, 1, 2))
+    cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=3,
+                  lineType=cv2.LINE_AA)
+
+
 def draw_finger_occlusion_points(
     frame: np.ndarray,
     occlusion_points: list[dict],    # output of gaze.finger_screen_points

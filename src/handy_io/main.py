@@ -46,7 +46,11 @@ import numpy as np
 from .capture import open_camera, frame_generator
 from .landmarks import FaceMesh, GazeLandmarks
 from .heatmap import GazeHeatmap
-from .hands import HandTracker, HandsResult, draw_hands, draw_finger_occlusion_points, FINGERTIPS
+from .hands import (
+    HandTracker, HandsResult,
+    draw_hands, draw_finger_occlusion_points, draw_pinch_square, pinch_transform,
+    FINGERTIPS,
+)
 from . import gaze, calibration, pose
 
 # ── MODE ────────────────────────────────────────────────────────────────────
@@ -471,6 +475,9 @@ def _run_hands_only(monitor: Monitor) -> None:
 
             if show_hands and hands_result:
                 draw_hands(display, hands_result, mirror_x=True)
+                pt = pinch_transform(hands_result, sw, sh)
+                if pt is not None:
+                    draw_pinch_square(display, pt)
 
             _fps_count += 1
             if _fps_count >= 30:
@@ -623,6 +630,9 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             #    already-mirrored frame, so x must be flipped.
             if show_hands and hands_result:
                 draw_hands(display, hands_result, mirror_x=True)
+                pt = pinch_transform(hands_result, sw, sh)
+                if pt is not None:
+                    draw_pinch_square(display, pt)
 
             # 3. Gaze heatmap — true screen-space, no flip.
             hm = heatmap.render()
