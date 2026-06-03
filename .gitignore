@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+.env.*
+
+# UV / packaging
+.uv-cache/
+*.egg-info/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# C++ / CMake
+cpp/build/
+cpp/_build/
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Downloaded ML models
+src/handy_io/models/
+
+# Logs
+*.log
+
+# Test artifacts / data captures
+data/
+recordings/
+*.mp4
+*.avi
+*.mov
