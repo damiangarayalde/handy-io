@@ -135,14 +135,28 @@ def extract_features_full(gl: GazeLandmarks) -> np.ndarray:
     """
     Feature vector for full mode.
 
-    Returns a 5-element vector:
-      [ray_x, ray_y, ray_z, distance_m, 1.0]
-    The trailing 1.0 gives the calibration matrix a bias term to absorb
-    per-session offsets without a separate intercept.
+    Distance is used to project the gaze ray onto a virtual screen plane at a
+    fixed reference depth, so the calibration matrix only needs to correct
+    angular offsets — not compensate for nonlinear depth-scale variation.
+
+    Screen-plane intersection at reference depth D:
+      hit_x = D * ray_x / ray_z
+      hit_y = D * ray_y / ray_z
+
+    This is the correct perspective projection; it automatically expands/
+    contracts with distance so the calibration holds regardless of how far
+    the user sits from the screen.
+
+    Returns a 3-element vector [hit_x, hit_y, 1.0].
     """
-    ray = _gaze_ray_head_compensated(gl)
+    ray  = _gaze_ray_head_compensated(gl)
+    # Reference plane depth: use the estimated distance so the projection
+    # stays in a stable coordinate range across sessions.
     dist = _estimate_distance_m(gl)
-    return np.array([ray[0], ray[1], ray[2], dist, 1.0])
+    rz   = ray[2] if abs(ray[2]) > 1e-3 else 1e-3
+    hit_x = dist * ray[0] / rz
+    hit_y = dist * ray[1] / rz
+    return np.array([hit_x, hit_y, 1.0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

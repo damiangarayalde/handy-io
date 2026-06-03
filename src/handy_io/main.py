@@ -102,6 +102,21 @@ def _run_calibration(
     return cal.matrix
 
 
+def _draw_gaze_marker(frame: np.ndarray, x: int, y: int) -> None:
+    r, thickness = 18, 2
+    arm = 28
+    col_outer = (255, 255, 255)
+    col_inner = (0, 180, 255)
+    # outer ring + crosshair in white
+    cv2.circle(frame, (x, y), r, col_outer, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x - arm, y), (x - r - 2, y), col_outer, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x + r + 2, y), (x + arm, y), col_outer, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x, y - arm), (x, y - r - 2), col_outer, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x, y + r + 2), (x, y + arm), col_outer, thickness, cv2.LINE_AA)
+    # small centre dot in orange
+    cv2.circle(frame, (x, y), 4, col_inner, -1, cv2.LINE_AA)
+
+
 def run() -> None:
     cap  = open_camera(CAMERA_INDEX, CAM_W, CAM_H)
     mesh = FaceMesh(output_face_transform=_NEED_FACE_TRANSFORM)
@@ -150,6 +165,10 @@ def run() -> None:
             display[mask] = cv2.addWeighted(
                 display, 1 - ALPHA, hm, ALPHA, 0
             )[mask]
+
+            # Gaze marker — only when we have a valid estimate
+            if gl is not None:
+                _draw_gaze_marker(display, gx, gy)
 
             cv2.imshow(WIN_NAME, display)
 
