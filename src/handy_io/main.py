@@ -48,7 +48,10 @@ from .landmarks import FaceMesh, GazeLandmarks
 from .heatmap import GazeHeatmap
 from .hands import (
     HandTracker, HandsResult,
-    draw_hands, draw_finger_occlusion_points, draw_pinch_square, pinch_transform,
+    draw_hands, draw_finger_occlusion_points,
+    draw_squares, draw_pinch_cursor,
+    pinch_transform, pick_square, apply_grab,
+    GrabState, make_default_squares,
     FINGERTIPS,
 )
 from . import gaze, calibration, pose
@@ -460,8 +463,10 @@ def _run_hands_only(monitor: Monitor) -> None:
     hand_thread = InferenceThread(hand_model, "hand-inference")
     hand_thread.start()
 
-    print("handy-io  [hands only]  |  q=quit  h=toggle skeleton")
+    print("handy-io  [hands only]  |  q=quit  h=toggle skeleton  SPACE=grab")
     show_hands = True
+    squares = make_default_squares(sw, sh)
+    grab: GrabState | None = None
     _fps_t0 = time.monotonic()
     _fps_count = 0
     _fps_display = 0.0
@@ -473,11 +478,18 @@ def _run_hands_only(monitor: Monitor) -> None:
 
             display = cv2.flip(cv2.resize(frame_bgr, (sw, sh)), 1)
 
+            pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+
+            if pt is not None and grab is not None:
+                apply_grab(grab, pt, squares)
+
+            draw_squares(display, squares, selected_idx=grab.square_idx if grab else None)
+
             if show_hands and hands_result:
                 draw_hands(display, hands_result, mirror_x=True)
-                pt = pinch_transform(hands_result, sw, sh)
-                if pt is not None:
-                    draw_pinch_square(display, pt)
+
+            if pt is not None and grab is None:
+                draw_pinch_cursor(display, pt)
 
             _fps_count += 1
             if _fps_count >= 30:
@@ -486,7 +498,8 @@ def _run_hands_only(monitor: Monitor) -> None:
                 _fps_count = 0
             cv2.putText(display, f"{_fps_display:.1f} fps", (12, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
-            cv2.putText(display, "HANDS ONLY", (12, sh - 20),
+            status_text = f"GRABBED #{grab.square_idx + 1}" if grab else "HANDS ONLY"
+            cv2.putText(display, status_text, (12, sh - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1, cv2.LINE_AA)
 
             cv2.imshow(WIN_NAME, display)
@@ -495,6 +508,23 @@ def _run_hands_only(monitor: Monitor) -> None:
                 break
             elif key == ord("h"):
                 show_hands = not show_hands
+            elif key == ord(" "):
+                if grab is None:
+                    # press: try to select a square
+                    if pt is not None:
+                        idx = pick_square(pt, squares, screen_h=sh)
+                        if idx is not None:
+                            sq = squares[idx]
+                            grab = GrabState(
+                                square_idx=idx,
+                                grab_cx=pt.cx, grab_cy=pt.cy,
+                                grab_size=pt.size, grab_angle=pt.angle_deg,
+                                sq_cx=sq.cx, sq_cy=sq.cy,
+                                sq_size=sq.size, sq_angle=sq.angle_deg,
+                            )
+                else:
+                    # release
+                    grab = None
     finally:
         hand_thread.stop()
         cap.release()
@@ -553,10 +583,12 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
         hand_thread = InferenceThread(hand_model, "hand-inference")
         hand_thread.start()
 
-    print("handy-io live  |  q=quit  c=clear  r=recalibrate  d=glasses-cam debug  h=hands")
+    print("handy-io live  |  q=quit  c=clear  r=recalibrate  d=glasses-cam debug  h=hands  SPACE=grab")
 
     show_glasses_debug = False
     show_hands = SHOW_HANDS
+    squares = make_default_squares(sw, sh)
+    grab: GrabState | None = None
 
     # FPS tracking
     _fps_t0 = time.monotonic()
@@ -626,22 +658,28 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             # 1. Mirror the camera feed so the user sees a natural reflection.
             display = cv2.flip(cv2.resize(frame_bgr, (sw, sh)), 1)
 
-            # 2. Hand skeleton — drawn in camera-normalised coords onto the
+            # 2. Pinch + square interaction (before hand skeleton so skeleton sits on top).
+            pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+            if pt is not None and grab is not None:
+                apply_grab(grab, pt, squares)
+            draw_squares(display, squares, selected_idx=grab.square_idx if grab else None)
+
+            # 3. Hand skeleton — drawn in camera-normalised coords onto the
             #    already-mirrored frame, so x must be flipped.
             if show_hands and hands_result:
                 draw_hands(display, hands_result, mirror_x=True)
-                pt = pinch_transform(hands_result, sw, sh)
-                if pt is not None:
-                    draw_pinch_square(display, pt)
 
-            # 3. Gaze heatmap — true screen-space, no flip.
+            if pt is not None and grab is None:
+                draw_pinch_cursor(display, pt)
+
+            # 4. Gaze heatmap — true screen-space, no flip.
             hm = heatmap.render()
             mask = hm.any(axis=2)
             display[mask] = cv2.addWeighted(
                 display, 1 - ALPHA, hm, ALPHA, 0
             )[mask]
 
-            # 4. Gaze marker and occlusion points — true screen-space, no flip.
+            # 5. Gaze marker and occlusion points — true screen-space, no flip.
             if gl is not None:
                 _draw_gaze_marker(display, gx, gy)
 
@@ -691,6 +729,21 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
                 show_glasses_debug = not show_glasses_debug
             elif key == ord("h"):
                 show_hands = not show_hands
+            elif key == ord(" "):
+                if grab is None:
+                    if pt is not None:
+                        idx = pick_square(pt, squares, screen_h=sh)
+                        if idx is not None:
+                            sq = squares[idx]
+                            grab = GrabState(
+                                square_idx=idx,
+                                grab_cx=pt.cx, grab_cy=pt.cy,
+                                grab_size=pt.size, grab_angle=pt.angle_deg,
+                                sq_cx=sq.cx, sq_cy=sq.cy,
+                                sq_size=sq.size, sq_angle=sq.angle_deg,
+                            )
+                else:
+                    grab = None
             elif key == ord("r"):
                 prev_gaze.clear()
                 heatmap._buf[:] = 0

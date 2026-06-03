@@ -245,11 +245,65 @@ def draw_hands(
 
 @dataclass
 class PinchTransform:
-    """Square transform derived from the right hand's thumb–index pinch."""
+    """Raw pinch state from the right hand's thumb–index pair (one frame)."""
     cx: int          # screen x of midpoint
     cy: int          # screen y of midpoint
     size: int        # side length in pixels
-    angle_deg: float # rotation in degrees (XY plane angle of thumb→index axis)
+    angle_deg: float # XY-plane angle of thumb→index axis, degrees
+
+
+@dataclass
+class SquareObject:
+    """A persistent interactive square on the viewport."""
+    cx: float
+    cy: float
+    size: float
+    angle_deg: float
+    color: tuple[int, int, int] = (0, 220, 255)
+
+    def corners(self) -> np.ndarray:
+        """Return (4,2) int32 screen corners."""
+        half = self.size / 2
+        local = np.array([[-half, -half], [half, -half],
+                          [half,  half], [-half,  half]], dtype=np.float32)
+        rad = np.radians(self.angle_deg)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+        rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+        return ((rot @ local.T).T + np.array([self.cx, self.cy])).astype(np.int32)
+
+    def contains_point(self, px: float, py: float) -> bool:
+        """True when (px, py) is inside the square (axis-aligned bounding check in local space)."""
+        dx = px - self.cx
+        dy = py - self.cy
+        rad = np.radians(-self.angle_deg)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+        lx = cos_a * dx - sin_a * dy
+        ly = sin_a * dx + cos_a * dy
+        half = self.size / 2
+        return abs(lx) <= half and abs(ly) <= half
+
+    def distance_to(self, px: float, py: float) -> float:
+        return float(np.hypot(px - self.cx, py - self.cy))
+
+
+def make_default_squares(screen_w: int, screen_h: int) -> list[SquareObject]:
+    """Spawn a small set of squares scattered across the viewport."""
+    base = screen_h * 0.18
+    positions = [
+        (0.25, 0.30), (0.55, 0.25), (0.75, 0.60),
+        (0.35, 0.65), (0.15, 0.55),
+    ]
+    colors = [
+        (0, 220, 255), (80, 255, 120), (255, 160, 60),
+        (220, 80, 220), (255, 220, 50),
+    ]
+    return [
+        SquareObject(
+            cx=x * screen_w, cy=y * screen_h,
+            size=base, angle_deg=0.0, color=c,
+        )
+        for (x, y), c in zip(positions, colors)
+    ]
 
 
 def pinch_transform(
@@ -263,12 +317,8 @@ def pinch_transform(
     mirror_x: bool = True,
 ) -> PinchTransform | None:
     """
-    Derive translation, rotation, and size for the pinch square from the right
-    hand's thumb-tip (4) and index-tip (8):
-      - size     : 3D distance mapped to [min_frac*sh, max_frac*sh]
-      - position : midpoint of the two tips in screen pixels
-      - rotation : XY-plane angle of the thumb→index vector (degrees)
-    Returns None when no right hand is detected.
+    Derive translation, rotation, and size from the right hand's thumb-tip (4)
+    and index-tip (8).  Returns None when no right hand is detected.
     """
     for hand in hands_result.hands:
         if hand.handedness != "Right":
@@ -278,43 +328,127 @@ def pinch_transform(
 
         dist = float(np.linalg.norm(thumb - index))
         t = np.clip(dist / max_dist, 0.0, 1.0)
-        size = int(min_frac * screen_h + t * (max_frac - min_frac) * screen_h)
+        size = min_frac * screen_h + t * (max_frac - min_frac) * screen_h
 
         mid = (thumb + index) / 2.0
-        mx = mid[0] if not mirror_x else 1.0 - mid[0]
-        cx = int(np.clip(mx,    0.0, 1.0) * screen_w)
-        cy = int(np.clip(mid[1], 0.0, 1.0) * screen_h)
+        mx = 1.0 - mid[0] if mirror_x else mid[0]
+        cx = float(np.clip(mx,    0.0, 1.0) * screen_w)
+        cy = float(np.clip(mid[1], 0.0, 1.0) * screen_h)
 
-        # Angle of the thumb→index vector in the XY plane.
-        # Mirror flips x so we negate dx accordingly.
         dx = index[0] - thumb[0]
         if mirror_x:
             dx = -dx
         dy = index[1] - thumb[1]
         angle_deg = float(np.degrees(np.arctan2(dy, dx)))
 
-        return PinchTransform(cx=cx, cy=cy, size=size, angle_deg=angle_deg)
+        return PinchTransform(cx=int(cx), cy=int(cy), size=int(size), angle_deg=angle_deg)
     return None
 
 
-def draw_pinch_square(frame: np.ndarray, pt: PinchTransform) -> None:
-    """Draw a rotated, translated square described by *pt* onto *frame* (BGR, in-place)."""
-    half = pt.size // 2
-    corners = np.array([
-        [-half, -half],
-        [ half, -half],
-        [ half,  half],
-        [-half,  half],
-    ], dtype=np.float32)
+# ── grab state ────────────────────────────────────────────────────────────────
 
-    rad = np.radians(pt.angle_deg)
-    cos_a, sin_a = np.cos(rad), np.sin(rad)
-    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+@dataclass
+class GrabState:
+    """
+    Snapshot taken at spacebar press — holds the offset between the pinch
+    midpoint and the grabbed square's centre, so the square doesn't jump.
+    Also records the size and angle deltas so the object deforms continuously.
+    """
+    square_idx: int
+    # pinch values at grab time
+    grab_cx: float
+    grab_cy: float
+    grab_size: float
+    grab_angle: float
+    # square values at grab time
+    sq_cx: float
+    sq_cy: float
+    sq_size: float
+    sq_angle: float
 
-    rotated = (rot @ corners.T).T + np.array([pt.cx, pt.cy], dtype=np.float32)
-    pts = rotated.astype(np.int32).reshape((-1, 1, 2))
-    cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=3,
-                  lineType=cv2.LINE_AA)
+
+def pick_square(
+    pinch: PinchTransform,
+    squares: list[SquareObject],
+    *,
+    max_dist_frac: float = 0.25,
+    screen_h: int = 1080,
+) -> int | None:
+    """
+    Return the index of the square whose centre is closest to *pinch* midpoint,
+    giving priority to squares that actually contain the midpoint.
+    Falls back to nearest centre within max_dist_frac * screen_h.
+    """
+    px, py = float(pinch.cx), float(pinch.cy)
+    threshold = max_dist_frac * screen_h
+
+    # Prefer a square that contains the pinch midpoint
+    for i, sq in enumerate(squares):
+        if sq.contains_point(px, py):
+            return i
+
+    # Fall back to nearest centre within threshold
+    best_i, best_d = None, threshold
+    for i, sq in enumerate(squares):
+        d = sq.distance_to(px, py)
+        if d < best_d:
+            best_d, best_i = d, i
+    return best_i
+
+
+def apply_grab(
+    grab: GrabState,
+    pinch: PinchTransform,
+    squares: list[SquareObject],
+) -> None:
+    """Update the grabbed square's transform to follow the current pinch."""
+    sq = squares[grab.square_idx]
+    dcx = pinch.cx - grab.grab_cx
+    dcy = pinch.cy - grab.grab_cy
+    sq.cx = grab.sq_cx + dcx
+    sq.cy = grab.sq_cy + dcy
+    sq.size = grab.sq_size * (pinch.size / grab.grab_size) if grab.grab_size > 0 else grab.sq_size
+    sq.angle_deg = grab.sq_angle + (pinch.angle_deg - grab.grab_angle)
+
+
+# ── drawing ───────────────────────────────────────────────────────────────────
+
+def _draw_square_shape(
+    frame: np.ndarray,
+    sq: SquareObject,
+    *,
+    selected: bool = False,
+) -> None:
+    pts = sq.corners().reshape((-1, 1, 2))
+    thickness = 4 if selected else 2
+    cv2.polylines(frame, [pts], isClosed=True, color=sq.color,
+                  thickness=thickness, lineType=cv2.LINE_AA)
+    if selected:
+        # filled semi-transparent highlight
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [sq.corners()], sq.color)
+        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+        # bright corner dots
+        for corner in sq.corners():
+            cv2.circle(frame, tuple(corner), 6, sq.color, -1, cv2.LINE_AA)
+
+
+def draw_squares(
+    frame: np.ndarray,
+    squares: list[SquareObject],
+    selected_idx: int | None = None,
+) -> None:
+    for i, sq in enumerate(squares):
+        _draw_square_shape(frame, sq, selected=i == selected_idx)
+
+
+def draw_pinch_cursor(frame: np.ndarray, pinch: PinchTransform) -> None:
+    """Small crosshair at the pinch midpoint — visible when nothing is grabbed."""
+    cx, cy = pinch.cx, pinch.cy
+    arm = 18
+    cv2.line(frame, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 5, (0, 220, 255), -1, cv2.LINE_AA)
 
 
 def draw_finger_occlusion_points(
