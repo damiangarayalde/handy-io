@@ -52,12 +52,23 @@ class GazeLandmarks:
     face_transform: np.ndarray | None = None  # (4, 4) float64
 
 
+def _make_base_options(model_path: Path, use_gpu: bool) -> BaseOptions:
+    delegate = BaseOptions.Delegate.GPU if use_gpu else BaseOptions.Delegate.CPU
+    return BaseOptions(model_asset_path=str(model_path), delegate=delegate)
+
+
 class FaceMesh:
-    def __init__(self, max_faces: int = 1, output_face_transform: bool = True) -> None:
+    def __init__(
+        self,
+        max_faces: int = 1,
+        output_face_transform: bool = True,
+        use_gpu: bool = True,
+    ) -> None:
         model_path = _ensure_model()
         self._output_face_transform = output_face_transform
+        base = _make_base_options(model_path, use_gpu)
         options = vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(model_path)),
+            base_options=base,
             running_mode=vision.RunningMode.VIDEO,
             num_faces=max_faces,
             min_face_detection_confidence=0.5,

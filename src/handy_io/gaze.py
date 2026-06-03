@@ -211,6 +211,70 @@ def map_to_screen(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Finger occlusion — screen points "behind" each fingertip
+# ─────────────────────────────────────────────────────────────────────────────
+
+def finger_screen_points(
+    gl: GazeLandmarks,
+    fingertip_xy: np.ndarray,   # (N, 2) normalised image coords of fingertips
+    calib_matrix: np.ndarray,
+    calib_poly_degree: int,
+) -> list[dict]:
+    """
+    For each fingertip, compute where on-screen the finger is occluding the
+    user's view — one point per eye and one average.
+
+    The approach: treat the fingertip's image position as if the iris were
+    there, compute the same iris-offset features used during calibration,
+    then apply the calibration matrix to get a screen coordinate.
+
+    Returns a list of dicts, one per fingertip:
+      {
+        "left":  np.ndarray (2,) normalised screen xy,
+        "right": np.ndarray (2,) normalised screen xy,
+        "avg":   np.ndarray (2,) normalised screen xy,
+      }
+    All values may be None if the computation is degenerate.
+    """
+    from . import calibration as _cal
+
+    left_outer  = gl.left_eye_corners[_OUTER,  :2]
+    left_inner  = gl.left_eye_corners[_INNER,  :2]
+    right_outer = gl.right_eye_corners[_OUTER, :2]
+    right_inner = gl.right_eye_corners[_INNER, :2]
+
+    left_mid   = (left_outer  + left_inner)  / 2.0
+    right_mid  = (right_outer + right_inner) / 2.0
+    left_span  = np.linalg.norm(left_inner  - left_outer)  + 1e-6
+    right_span = np.linalg.norm(right_inner - right_outer) + 1e-6
+
+    results = []
+    for tip_xy in fingertip_xy:
+        tip = tip_xy[:2]
+
+        # Synthetic iris offset: "where would you look if your iris were at tip?"
+        left_off  = (tip - left_mid)  / left_span
+        right_off = (tip - right_mid) / right_span
+
+        # Per-eye: duplicate the single eye's offset into both feature slots so
+        # the calibration poly sees a consistent-magnitude input.
+        feat_left  = np.array([left_off[0],  left_off[1],  left_off[0],  left_off[1]])
+        feat_right = np.array([right_off[0], right_off[1], right_off[0], right_off[1]])
+        feat_avg   = np.array([left_off[0],  left_off[1],  right_off[0], right_off[1]])
+
+        try:
+            sc_left  = _cal.apply(feat_left,  calib_matrix, calib_poly_degree)
+            sc_right = _cal.apply(feat_right, calib_matrix, calib_poly_degree)
+            sc_avg   = _cal.apply(feat_avg,   calib_matrix, calib_poly_degree)
+        except Exception:
+            sc_left = sc_right = sc_avg = None
+
+        results.append({"left": sc_left, "right": sc_right, "avg": sc_avg})
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Legacy uncalibrated fallback (used before calibration is complete)
 # ─────────────────────────────────────────────────────────────────────────────
 
