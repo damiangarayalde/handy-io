@@ -53,8 +53,11 @@ from .hands import (
     pinch_transform, pick_square, apply_grab,
     GrabState, make_default_squares,
     FINGERTIPS,
+    GestureClass, classify_gesture,
+    InteractionMode, AxisConstraint, ModalState,
 )
 from . import gaze, calibration, pose
+from .ui import CheatSheet
 
 # ── MODE ────────────────────────────────────────────────────────────────────
 MODE: str = "calibration_only"   # "calibration_only" | "full"
@@ -288,6 +291,220 @@ def _draw_gaze_marker(frame: np.ndarray, x: int, y: int) -> None:
     cv2.circle(frame, (x, y), 4, col_inner, -1, cv2.LINE_AA)
 
 
+# ── Blender-style HUD and interaction helpers ────────────────────────────────
+
+_MODE_COLORS: dict[InteractionMode, tuple[int, int, int]] = {
+    InteractionMode.IDLE:   (160, 160, 160),
+    InteractionMode.MOVE:   ( 80, 200, 255),
+    InteractionMode.ROTATE: ( 80, 255, 140),
+    InteractionMode.SCALE:  (255, 180,  60),
+}
+
+_GESTURE_LABELS: dict[GestureClass, str] = {
+    GestureClass.FIST:      "FIST",
+    GestureClass.PINCH:     "PINCH",
+    GestureClass.POINT:     "POINT",
+    GestureClass.OPEN_PALM: "PALM",
+    GestureClass.V_SIGN:    "V",
+    GestureClass.GUN:       "GUN",
+    GestureClass.UNKNOWN:   "",
+}
+
+
+def _draw_hud(
+    frame: np.ndarray,
+    modal: ModalState,
+    gesture: GestureClass,
+    sw: int,
+    sh: int,
+) -> None:
+    """Bottom-left HUD: current mode, axis constraint, active gesture."""
+    mode_color = _MODE_COLORS[modal.mode]
+    mode_label = modal.mode.value
+    if modal.axis is not AxisConstraint.NONE:
+        mode_label += f" · {modal.axis.value}"
+
+    # mode pill background
+    (tw, th), _ = cv2.getTextSize(mode_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+    pad = 8
+    x0, y0 = 12, sh - 52
+    cv2.rectangle(frame, (x0 - pad, y0 - th - pad), (x0 + tw + pad, y0 + pad),
+                  (20, 20, 20), -1)
+    cv2.rectangle(frame, (x0 - pad, y0 - th - pad), (x0 + tw + pad, y0 + pad),
+                  mode_color, 1)
+    cv2.putText(frame, mode_label, (x0, y0),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2, cv2.LINE_AA)
+
+    # gesture label
+    g_label = _GESTURE_LABELS.get(gesture, "")
+    if g_label:
+        cv2.putText(frame, g_label, (12, sh - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+
+    # key hint bar (only when idle)
+    if modal.mode is InteractionMode.IDLE:
+        hint = "G=move  R=rotate  S=scale  N=new  Del=delete  Tab=cycle  A=all  Z=heatmap"
+        cv2.putText(frame, hint, (sw // 2 - 340, sh - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
+    else:
+        hint = "X/Y=lock axis   Enter/Pinch=confirm   Esc/Palm=cancel"
+        cv2.putText(frame, hint, (sw // 2 - 240, sh - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
+
+
+def _get_right_hand_gesture(hands_result: "HandsResult | None") -> GestureClass:
+    if not hands_result:
+        return GestureClass.UNKNOWN
+    for hand in hands_result.hands:
+        if hand.handedness == "Right":
+            return classify_gesture(hand)
+    return GestureClass.UNKNOWN
+
+
+def _handle_key_and_gesture(
+    key: int,
+    gesture: GestureClass,
+    prev_gesture: GestureClass,
+    modal: ModalState,
+    squares: list,
+    pinch: "PinchTransform | None",
+    sw: int,
+    sh: int,
+    gaze_xy: "tuple[int,int] | None" = None,
+    *,
+    heatmap_buf: "np.ndarray | None" = None,
+    prev_gaze: "list | None" = None,
+    heatmap_alpha_ref: "list[float] | None" = None,  # [alpha] mutable box
+    selected_indices: "list[int] | None" = None,      # mutable box: [idx] or []
+) -> None:
+    """
+    Mutates *modal*, *squares*, and optional mutable boxes in-place.
+    Handles both keyboard (Blender shortcuts) and gesture edge-triggers.
+    """
+    # ── gesture edge-triggers (only on gesture *change*) ─────────────────────
+    gesture_just_changed = gesture is not prev_gesture
+
+    # Fist → enter MOVE (same as pressing G)
+    if (gesture_just_changed and gesture is GestureClass.FIST
+            and not modal.active and pinch is not None):
+        idx = _select_target(pinch, squares, selected_indices, sw, sh)
+        if idx is not None:
+            _modal_enter(modal, InteractionMode.MOVE, idx, pinch, squares)
+
+    # Pinch → confirm active operation (same as Enter)
+    if (gesture_just_changed and gesture is GestureClass.PINCH and modal.active):
+        modal.commit()
+        if selected_indices is not None:
+            selected_indices.clear()
+
+    # Open palm → cancel active operation (same as Esc)
+    if (gesture_just_changed and gesture is GestureClass.OPEN_PALM and modal.active):
+        modal.cancel(squares)
+        if selected_indices is not None:
+            selected_indices.clear()
+
+    # ── keyboard shortcuts ────────────────────────────────────────────────────
+    if key == ord("g") and not modal.active and pinch is not None:
+        idx = _select_target(pinch, squares, selected_indices, sw, sh)
+        if idx is not None:
+            _modal_enter(modal, InteractionMode.MOVE, idx, pinch, squares)
+
+    elif key == ord("r") and not modal.active and pinch is not None:
+        idx = _select_target(pinch, squares, selected_indices, sw, sh)
+        if idx is not None:
+            _modal_enter(modal, InteractionMode.ROTATE, idx, pinch, squares)
+
+    elif key == ord("s") and not modal.active and pinch is not None:
+        idx = _select_target(pinch, squares, selected_indices, sw, sh)
+        if idx is not None:
+            _modal_enter(modal, InteractionMode.SCALE, idx, pinch, squares)
+
+    elif key == ord("x") and modal.active:
+        # toggle X-axis lock; if pressed again → delete when idle handled below
+        modal.axis = (AxisConstraint.NONE
+                      if modal.axis is AxisConstraint.X else AxisConstraint.X)
+
+    elif key == ord("y") and modal.active:
+        modal.axis = (AxisConstraint.NONE
+                      if modal.axis is AxisConstraint.Y else AxisConstraint.Y)
+
+    elif key in (13, ord("\r")) and modal.active:   # Enter
+        modal.commit()
+        if selected_indices is not None:
+            selected_indices.clear()
+
+    elif key == 27 and modal.active:               # Esc  — cancel only if active
+        modal.cancel(squares)
+        if selected_indices is not None:
+            selected_indices.clear()
+
+    elif key == ord("a"):                          # select / deselect all
+        if selected_indices is not None:
+            if len(selected_indices) == len(squares):
+                selected_indices.clear()
+            else:
+                selected_indices.clear()
+                selected_indices.extend(range(len(squares)))
+
+    elif key in (127, 8) and not modal.active:     # Delete / Backspace
+        # delete selected squares (reverse order to keep indices valid)
+        if selected_indices:
+            for i in sorted(selected_indices, reverse=True):
+                if 0 <= i < len(squares):
+                    squares.pop(i)
+            selected_indices.clear()
+        elif pinch is not None:
+            idx = pick_square(pinch, squares, screen_h=sh)
+            if idx is not None:
+                squares.pop(idx)
+
+    elif key == ord("n") and not modal.active:     # new square at gaze or centre
+        from .hands import SquareObject
+        cx = gaze_xy[0] if gaze_xy else sw // 2
+        cy = gaze_xy[1] if gaze_xy else sh // 2
+        squares.append(SquareObject(cx=cx, cy=cy, size=sh * 0.15, angle_deg=0.0))
+
+    elif key == ord("\t") and not modal.active:    # Tab — cycle selection
+        if selected_indices is not None and squares:
+            if not selected_indices:
+                selected_indices.append(0)
+            else:
+                selected_indices[0] = (selected_indices[0] + 1) % len(squares)
+
+    elif key == ord("z") and heatmap_alpha_ref is not None:  # cycle heatmap opacity
+        steps = [0.0, 0.3, 0.55, 0.8]
+        cur = heatmap_alpha_ref[0]
+        # find next step
+        diffs = [abs(cur - s) for s in steps]
+        cur_idx = diffs.index(min(diffs))
+        heatmap_alpha_ref[0] = steps[(cur_idx + 1) % len(steps)]
+
+
+def _select_target(
+    pinch: "PinchTransform",
+    squares: list,
+    selected_indices: "list[int] | None",
+    sw: int,
+    sh: int,
+) -> "int | None":
+    """Return the square index to operate on: hovered, or first selected."""
+    if selected_indices:
+        return selected_indices[0]
+    return pick_square(pinch, squares, screen_h=sh)
+
+
+def _modal_enter(
+    modal: ModalState,
+    mode: InteractionMode,
+    idx: int,
+    pinch: "PinchTransform",
+    squares: list,
+) -> None:
+    from .hands import SquareObject
+    sq = squares[idx]
+    modal.enter(mode, idx, pinch, sq)
+
+
 # ── glasses-cam thread ────────────────────────────────────────────────────────
 
 class _GlassesCamThread(threading.Thread):
@@ -463,10 +680,17 @@ def _run_hands_only(monitor: Monitor) -> None:
     hand_thread = InferenceThread(hand_model, "hand-inference")
     hand_thread.start()
 
-    print("handy-io  [hands only]  |  q=quit  h=toggle skeleton  SPACE=grab")
+    print("handy-io  [hands only]  |  q=quit  h=toggle skeleton  ?=cheat-sheet")
+    print("  G=move  R=rotate  S=scale  N=new  Del=delete  Tab=cycle  A=all")
+    print("  Fist=grab  Pinch=confirm  Palm=cancel")
+
     show_hands = True
     squares = make_default_squares(sw, sh)
-    grab: GrabState | None = None
+    modal = ModalState()
+    selected_indices: list[int] = []
+    prev_gesture = GestureClass.UNKNOWN
+    cheat = CheatSheet()
+
     _fps_t0 = time.monotonic()
     _fps_count = 0
     _fps_display = 0.0
@@ -479,17 +703,26 @@ def _run_hands_only(monitor: Monitor) -> None:
             display = cv2.flip(cv2.resize(frame_bgr, (sw, sh)), 1)
 
             pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+            gesture = _get_right_hand_gesture(hands_result)
 
-            if pt is not None and grab is not None:
-                apply_grab(grab, pt, squares)
+            # apply continuous modal transform
+            if modal.active and pt is not None:
+                modal.apply(pt, squares)
 
-            draw_squares(display, squares, selected_idx=grab.square_idx if grab else None)
+            # draw squares — highlight selected or grabbed
+            sel_idx = modal.square_idx if modal.active else (
+                selected_indices[0] if selected_indices else None)
+            draw_squares(display, squares, selected_idx=sel_idx)
 
             if show_hands and hands_result:
                 draw_hands(display, hands_result, mirror_x=True)
 
-            if pt is not None and grab is None:
+            if pt is not None and not modal.active:
                 draw_pinch_cursor(display, pt)
+
+            # HUD + cheat-sheet
+            _draw_hud(display, modal, gesture, sw, sh)
+            cheat.draw(display)
 
             _fps_count += 1
             if _fps_count >= 30:
@@ -498,33 +731,25 @@ def _run_hands_only(monitor: Monitor) -> None:
                 _fps_count = 0
             cv2.putText(display, f"{_fps_display:.1f} fps", (12, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
-            status_text = f"GRABBED #{grab.square_idx + 1}" if grab else "HANDS ONLY"
-            cv2.putText(display, status_text, (12, sh - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1, cv2.LINE_AA)
 
             cv2.imshow(WIN_NAME, display)
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+
+            if key in (ord("q"),):
                 break
+            elif key == 27 and not modal.active and not cheat.open:
+                break
+            elif cheat.handle_key(key):
+                pass   # consumed by cheat-sheet
             elif key == ord("h"):
                 show_hands = not show_hands
-            elif key == ord(" "):
-                if grab is None:
-                    # press: try to select a square
-                    if pt is not None:
-                        idx = pick_square(pt, squares, screen_h=sh)
-                        if idx is not None:
-                            sq = squares[idx]
-                            grab = GrabState(
-                                square_idx=idx,
-                                grab_cx=pt.cx, grab_cy=pt.cy,
-                                grab_size=pt.size, grab_angle=pt.angle_deg,
-                                sq_cx=sq.cx, sq_cy=sq.cy,
-                                sq_size=sq.size, sq_angle=sq.angle_deg,
-                            )
-                else:
-                    # release
-                    grab = None
+            else:
+                _handle_key_and_gesture(
+                    key, gesture, prev_gesture, modal, squares, pt, sw, sh,
+                    selected_indices=selected_indices,
+                )
+
+            prev_gesture = gesture
     finally:
         hand_thread.stop()
         cap.release()
@@ -583,12 +808,18 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
         hand_thread = InferenceThread(hand_model, "hand-inference")
         hand_thread.start()
 
-    print("handy-io live  |  q=quit  c=clear  r=recalibrate  d=glasses-cam debug  h=hands  SPACE=grab")
+    print("handy-io live  |  q=quit  c=clear  d=glasses debug  h=hands  ?=cheat-sheet")
+    print("  G=move  R=rotate  S=scale  N=new  Del=delete  Tab=cycle  A=all  Z=heatmap")
+    print("  Fist=grab  Pinch=confirm  Palm=cancel  R (no hand)=recalibrate")
 
     show_glasses_debug = False
     show_hands = SHOW_HANDS
     squares = make_default_squares(sw, sh)
-    grab: GrabState | None = None
+    modal = ModalState()
+    selected_indices: list[int] = []
+    prev_gesture = GestureClass.UNKNOWN
+    heatmap_alpha = [ALPHA]   # mutable box so _handle_key_and_gesture can update it
+    cheat = CheatSheet()
 
     # FPS tracking
     _fps_t0 = time.monotonic()
@@ -658,26 +889,32 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             # 1. Mirror the camera feed so the user sees a natural reflection.
             display = cv2.flip(cv2.resize(frame_bgr, (sw, sh)), 1)
 
-            # 2. Pinch + square interaction (before hand skeleton so skeleton sits on top).
             pt = pinch_transform(hands_result, sw, sh) if hands_result else None
-            if pt is not None and grab is not None:
-                apply_grab(grab, pt, squares)
-            draw_squares(display, squares, selected_idx=grab.square_idx if grab else None)
+            gesture = _get_right_hand_gesture(hands_result)
 
-            # 3. Hand skeleton — drawn in camera-normalised coords onto the
-            #    already-mirrored frame, so x must be flipped.
+            # 2. Apply continuous modal transform, then draw squares.
+            if modal.active and pt is not None:
+                modal.apply(pt, squares)
+
+            sel_idx = modal.square_idx if modal.active else (
+                selected_indices[0] if selected_indices else None)
+            draw_squares(display, squares, selected_idx=sel_idx)
+
+            # 3. Hand skeleton
             if show_hands and hands_result:
                 draw_hands(display, hands_result, mirror_x=True)
 
-            if pt is not None and grab is None:
+            if pt is not None and not modal.active:
                 draw_pinch_cursor(display, pt)
 
             # 4. Gaze heatmap — true screen-space, no flip.
-            hm = heatmap.render()
-            mask = hm.any(axis=2)
-            display[mask] = cv2.addWeighted(
-                display, 1 - ALPHA, hm, ALPHA, 0
-            )[mask]
+            alpha = heatmap_alpha[0]
+            if alpha > 0.0:
+                hm = heatmap.render()
+                mask = hm.any(axis=2)
+                display[mask] = cv2.addWeighted(
+                    display, 1 - alpha, hm, alpha, 0
+                )[mask]
 
             # 5. Gaze marker and occlusion points — true screen-space, no flip.
             if gl is not None:
@@ -686,7 +923,7 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             for pts, tip_indices in finger_occlusion:
                 draw_finger_occlusion_points(display, pts, tip_indices)
 
-            # 5. ArUco markers in screen corners.
+            # 6. ArUco markers in screen corners.
             pose.draw_corner_markers(display, marker_px=ARUCO_MARKER_PX)
 
             # Optional: small glasses-cam debug inset (top-right corner)
@@ -708,6 +945,10 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
                 cv2.putText(display, status, (sw - 150, sh - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
+            # 7. Blender-style HUD + cheat-sheet
+            _draw_hud(display, modal, gesture, sw, sh)
+            cheat.draw(display)
+
             # FPS counter (update every 30 frames)
             _fps_count += 1
             if _fps_count >= 30:
@@ -720,8 +961,12 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             cv2.imshow(WIN_NAME, display)
 
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            if key in (ord("q"),):
                 break
+            elif key == 27 and not modal.active and not cheat.open:
+                break
+            elif cheat.handle_key(key):
+                pass   # consumed by cheat-sheet
             elif key == ord("c"):
                 heatmap._buf[:] = 0
                 prev_gaze.clear()
@@ -729,32 +974,51 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
                 show_glasses_debug = not show_glasses_debug
             elif key == ord("h"):
                 show_hands = not show_hands
-            elif key == ord(" "):
-                if grab is None:
-                    if pt is not None:
-                        idx = pick_square(pt, squares, screen_h=sh)
-                        if idx is not None:
-                            sq = squares[idx]
-                            grab = GrabState(
-                                square_idx=idx,
-                                grab_cx=pt.cx, grab_cy=pt.cy,
-                                grab_size=pt.size, grab_angle=pt.angle_deg,
-                                sq_cx=sq.cx, sq_cy=sq.cy,
-                                sq_size=sq.size, sq_angle=sq.angle_deg,
-                            )
+            elif key == ord("r") and modal.active:
+                # R while in a modal mode → axis/rotate handled by _handle_key_and_gesture
+                _handle_key_and_gesture(
+                    key, gesture, prev_gesture, modal, squares, pt, sw, sh,
+                    gaze_xy=(gx, gy),
+                    heatmap_buf=heatmap._buf,
+                    prev_gaze=prev_gaze,
+                    heatmap_alpha_ref=heatmap_alpha,
+                    selected_indices=selected_indices,
+                )
+            elif key == ord("r") and not modal.active:
+                # Ctrl+R style recalibrate: only when idle AND 'r' pressed
+                # (conflicts with rotate — use Ctrl+R conceptually; plain R enters rotate)
+                # To recalibrate, the user must first ensure no modal is active.
+                # We distinguish: if pinch is present → rotate, else → recalibrate.
+                if pt is not None:
+                    _handle_key_and_gesture(
+                        key, gesture, prev_gesture, modal, squares, pt, sw, sh,
+                        gaze_xy=(gx, gy),
+                        heatmap_buf=heatmap._buf,
+                        prev_gaze=prev_gaze,
+                        heatmap_alpha_ref=heatmap_alpha,
+                        selected_indices=selected_indices,
+                    )
                 else:
-                    grab = None
-            elif key == ord("r"):
-                prev_gaze.clear()
-                heatmap._buf[:] = 0
-                # Stop face thread, recalibrate synchronously, restart thread
-                face_thread.stop()
-                face_thread.join(timeout=2.0)
-                calib_matrix, calib_poly_degree = _run_calibration(
-                    cap, face_model, (sw, sh))
-                face_thread = InferenceThread(face_model, "face-inference")
-                face_thread.start()
-                _make_fullscreen_window(WIN_NAME, monitor)
+                    prev_gaze.clear()
+                    heatmap._buf[:] = 0
+                    face_thread.stop()
+                    face_thread.join(timeout=2.0)
+                    calib_matrix, calib_poly_degree = _run_calibration(
+                        cap, face_model, (sw, sh))
+                    face_thread = InferenceThread(face_model, "face-inference")
+                    face_thread.start()
+                    _make_fullscreen_window(WIN_NAME, monitor)
+            else:
+                _handle_key_and_gesture(
+                    key, gesture, prev_gesture, modal, squares, pt, sw, sh,
+                    gaze_xy=(gx, gy),
+                    heatmap_buf=heatmap._buf,
+                    prev_gaze=prev_gaze,
+                    heatmap_alpha_ref=heatmap_alpha,
+                    selected_indices=selected_indices,
+                )
+
+            prev_gesture = gesture
 
     finally:
         face_thread.stop()

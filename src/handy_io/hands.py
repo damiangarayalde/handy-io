@@ -25,8 +25,8 @@ Finger groups (tip, dip, pip, mcp):
 from __future__ import annotations
 import urllib.request
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -121,6 +121,163 @@ class HandsResult:
 
     def __bool__(self) -> bool:
         return bool(self.hands)
+
+
+# ── gesture classification ────────────────────────────────────────────────────
+
+class GestureClass(Enum):
+    UNKNOWN    = "unknown"
+    POINT      = "point"       # index only extended  → hover / aim
+    FIST       = "fist"        # no fingers extended  → grab / move
+    PINCH      = "pinch"       # thumb+index close, others curled → select / confirm
+    OPEN_PALM  = "open_palm"   # all 5 extended       → cancel / deselect
+    V_SIGN     = "v_sign"      # index+middle only    → cycle objects (Tab)
+    GUN        = "gun"         # thumb+index only extended → delete
+
+
+_PINCH_DIST_THRESHOLD = 0.07   # normalised units; thumb-index distance for pinch
+
+
+def classify_gesture(hand: HandResult) -> GestureClass:
+    """Map a HandResult to a GestureClass using finger extension + pinch distance."""
+    ext = hand.finger_extended()   # [thumb, index, middle, ring, pinky]
+    thumb, index, middle, ring, pinky = ext
+
+    # Pinch: thumb and index close together, regardless of extension state
+    thumb_tip = hand.landmarks[THUMB_TIP]
+    index_tip = hand.landmarks[INDEX_TIP]
+    dist = float(np.linalg.norm(thumb_tip[:2] - index_tip[:2]))
+    if dist < _PINCH_DIST_THRESHOLD and not middle and not ring and not pinky:
+        return GestureClass.PINCH
+
+    if thumb and index and not middle and not ring and not pinky:
+        return GestureClass.GUN
+
+    fingers_up = sum(ext)
+    if fingers_up == 0:
+        return GestureClass.FIST
+    if fingers_up == 5:
+        return GestureClass.OPEN_PALM
+    if index and not middle and not ring and not pinky:
+        return GestureClass.POINT
+    if index and middle and not ring and not pinky:
+        return GestureClass.V_SIGN
+
+    return GestureClass.UNKNOWN
+
+
+# ── modal interaction state machine ──────────────────────────────────────────
+
+class InteractionMode(Enum):
+    IDLE    = "IDLE"
+    MOVE    = "MOVE"    # G — translate only
+    ROTATE  = "ROTATE"  # R — rotate only
+    SCALE   = "SCALE"   # S — scale only
+
+
+class AxisConstraint(Enum):
+    NONE = "none"
+    X    = "X"
+    Y    = "Y"
+
+
+@dataclass
+class ModalState:
+    """
+    Blender-style modal operation state.
+
+    Lifecycle:
+      IDLE ──(G/fist)──► MOVE ──(Enter/pinch)──► IDLE (commit)
+                              └─(Esc/palm)──────► IDLE (revert)
+      IDLE ──(R)───────► ROTATE  (same confirm/cancel)
+      IDLE ──(S)───────► SCALE   (same confirm/cancel)
+
+    Axis constraint (X/Y keys while in any non-IDLE mode):
+      locks the operation to one screen axis.
+    """
+    mode: InteractionMode = InteractionMode.IDLE
+    axis: AxisConstraint  = AxisConstraint.NONE
+
+    # snapshot of the grabbed square at the moment the mode was entered
+    square_idx:   int   = -1
+    grab_cx:      float = 0.0
+    grab_cy:      float = 0.0
+    grab_size:    float = 0.0
+    grab_angle:   float = 0.0
+    sq_cx:        float = 0.0
+    sq_cy:        float = 0.0
+    sq_size:      float = 0.0
+    sq_angle:     float = 0.0
+
+    # whether a revert is pending (set on cancel before mode returns to IDLE)
+    _revert: bool = field(default=False, repr=False)
+
+    @property
+    def active(self) -> bool:
+        return self.mode is not InteractionMode.IDLE
+
+    def enter(
+        self,
+        mode: InteractionMode,
+        square_idx: int,
+        pinch: "PinchTransform",
+        sq: "SquareObject",
+    ) -> None:
+        self.mode        = mode
+        self.axis        = AxisConstraint.NONE
+        self.square_idx  = square_idx
+        self.grab_cx     = float(pinch.cx)
+        self.grab_cy     = float(pinch.cy)
+        self.grab_size   = float(pinch.size)
+        self.grab_angle  = float(pinch.angle_deg)
+        self.sq_cx       = sq.cx
+        self.sq_cy       = sq.cy
+        self.sq_size     = sq.size
+        self.sq_angle    = sq.angle_deg
+        self._revert     = False
+
+    def cancel(self, squares: "list[SquareObject]") -> None:
+        """Revert the grabbed square to its snapshot and return to IDLE."""
+        if self.square_idx >= 0 and self.square_idx < len(squares):
+            sq = squares[self.square_idx]
+            sq.cx        = self.sq_cx
+            sq.cy        = self.sq_cy
+            sq.size      = self.sq_size
+            sq.angle_deg = self.sq_angle
+        self._reset()
+
+    def commit(self) -> None:
+        """Accept the current transform and return to IDLE."""
+        self._reset()
+
+    def _reset(self) -> None:
+        self.mode       = InteractionMode.IDLE
+        self.axis       = AxisConstraint.NONE
+        self.square_idx = -1
+        self._revert    = False
+
+    def apply(self, pinch: "PinchTransform", squares: "list[SquareObject]") -> None:
+        """Drive the grabbed square transform from the current pinch, respecting axis lock."""
+        if not self.active or self.square_idx < 0:
+            return
+        sq = squares[self.square_idx]
+        dcx = pinch.cx - self.grab_cx
+        dcy = pinch.cy - self.grab_cy
+
+        if self.mode is InteractionMode.MOVE:
+            if self.axis is AxisConstraint.X:
+                dcy = 0.0
+            elif self.axis is AxisConstraint.Y:
+                dcx = 0.0
+            sq.cx = self.sq_cx + dcx
+            sq.cy = self.sq_cy + dcy
+
+        elif self.mode is InteractionMode.ROTATE:
+            sq.angle_deg = self.sq_angle + (pinch.angle_deg - self.grab_angle)
+
+        elif self.mode is InteractionMode.SCALE:
+            if self.grab_size > 0:
+                sq.size = self.sq_size * (pinch.size / self.grab_size)
 
 
 def _make_base_options(model_path: Path, use_gpu: bool) -> BaseOptions:
