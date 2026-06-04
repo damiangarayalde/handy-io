@@ -37,6 +37,7 @@ GLASSES_CAM controls the glasses-mounted second camera:
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 import queue
 import threading
 import time
@@ -50,8 +51,8 @@ from .hands import (
     HandTracker, HandsResult,
     draw_hands, draw_finger_occlusion_points,
     draw_squares, draw_pinch_cursor,
-    pinch_transform, pick_square, apply_grab,
-    GrabState, make_default_squares,
+    pinch_transform, PinchTransform, PinchEMA, pick_square,
+    make_default_squares,
     FINGERTIPS,
     GestureClass, classify_gesture,
     InteractionMode, AxisConstraint, ModalState,
@@ -161,8 +162,6 @@ class InferenceThread(threading.Thread):
         self._model.close()
 
 
-from dataclasses import dataclass
-
 @dataclass
 class Monitor:
     index: int
@@ -181,13 +180,15 @@ class Monitor:
 def _get_monitors() -> list[Monitor]:
     """Enumerate connected displays via CoreGraphics ctypes (macOS). Falls back to single entry."""
     try:
-        import ctypes, ctypes.util
+        import ctypes
+        import ctypes.util
 
         class _CGPoint(ctypes.Structure):
             _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
         class _CGSize(ctypes.Structure):
-            _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+            _fields_ = [("width", ctypes.c_double),
+                        ("height", ctypes.c_double)]
 
         class _CGRect(ctypes.Structure):
             _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
@@ -237,7 +238,8 @@ def _make_fullscreen_window(name: str, monitor: Monitor | None = None) -> None:
         cv2.resizeWindow(name, monitor.w, monitor.h)
         cv2.waitKey(100)
     else:
-        cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setWindowProperty(
+            name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 
 def _run_calibration(
@@ -293,12 +295,12 @@ def _draw_gaze_marker(frame: np.ndarray, x: int, y: int) -> None:
 
 # ── Blender-style HUD and interaction helpers ────────────────────────────────
 
-_MODE_COLORS: dict[InteractionMode, tuple[int, int, int]] = {
-    InteractionMode.IDLE:   (160, 160, 160),
-    InteractionMode.MOVE:   ( 80, 200, 255),
-    InteractionMode.ROTATE: ( 80, 255, 140),
-    InteractionMode.SCALE:  (255, 180,  60),
+_OP_COLORS: dict[InteractionMode, tuple[int, int, int]] = {
+    InteractionMode.MOVE:   ( 80, 200, 255),   # blue
+    InteractionMode.ROTATE: ( 80, 255, 140),   # green
+    InteractionMode.SCALE:  (255, 180,  60),   # orange
 }
+_IDLE_COLOR = (160, 160, 160)
 
 _GESTURE_LABELS: dict[GestureClass, str] = {
     GestureClass.FIST:      "FIST",
@@ -310,6 +312,10 @@ _GESTURE_LABELS: dict[GestureClass, str] = {
     GestureClass.UNKNOWN:   "",
 }
 
+# Display order and short labels for each op in the combined pill
+_OP_ORDER = [InteractionMode.MOVE, InteractionMode.ROTATE, InteractionMode.SCALE]
+_OP_LABEL = {InteractionMode.MOVE: "MOVE", InteractionMode.ROTATE: "ROT", InteractionMode.SCALE: "SCALE"}
+
 
 def _draw_hud(
     frame: np.ndarray,
@@ -318,22 +324,37 @@ def _draw_hud(
     sw: int,
     sh: int,
 ) -> None:
-    """Bottom-left HUD: current mode, axis constraint, active gesture."""
-    mode_color = _MODE_COLORS[modal.mode]
-    mode_label = modal.mode.value
-    if modal.axis is not AxisConstraint.NONE:
-        mode_label += f" · {modal.axis.value}"
-
-    # mode pill background
-    (tw, th), _ = cv2.getTextSize(mode_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+    """Bottom-left HUD: active ops (combined), axis constraint, gesture."""
     pad = 8
     x0, y0 = 12, sh - 52
-    cv2.rectangle(frame, (x0 - pad, y0 - th - pad), (x0 + tw + pad, y0 + pad),
-                  (20, 20, 20), -1)
-    cv2.rectangle(frame, (x0 - pad, y0 - th - pad), (x0 + tw + pad, y0 + pad),
-                  mode_color, 1)
-    cv2.putText(frame, mode_label, (x0, y0),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2, cv2.LINE_AA)
+
+    if not modal.active:
+        mode_label = "IDLE"
+        mode_color = _IDLE_COLOR
+        (tw, th), _ = cv2.getTextSize(mode_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.rectangle(frame, (x0 - pad, y0 - th - pad), (x0 + tw + pad, y0 + pad),
+                      (20, 20, 20), -1)
+        cv2.rectangle(frame, (x0 - pad, y0 - th - pad), (x0 + tw + pad, y0 + pad),
+                      mode_color, 1)
+        cv2.putText(frame, mode_label, (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2, cv2.LINE_AA)
+    else:
+        # Draw one coloured segment per active op, side by side
+        active_ops = [op for op in _OP_ORDER if op in modal.ops]
+        cx = x0
+        for op in active_ops:
+            color = _OP_COLORS[op]
+            label = _OP_LABEL[op]
+            if modal.axis is not AxisConstraint.NONE and op is InteractionMode.MOVE:
+                label += f"·{modal.axis.value}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            cv2.rectangle(frame, (cx - pad, y0 - th - pad), (cx + tw + pad, y0 + pad),
+                          (20, 20, 20), -1)
+            cv2.rectangle(frame, (cx - pad, y0 - th - pad), (cx + tw + pad, y0 + pad),
+                          color, 1)
+            cv2.putText(frame, label, (cx, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+            cx += tw + pad * 2 + 6   # gap between pills
 
     # gesture label
     g_label = _GESTURE_LABELS.get(gesture, "")
@@ -341,13 +362,13 @@ def _draw_hud(
         cv2.putText(frame, g_label, (12, sh - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
 
-    # key hint bar (only when idle)
-    if modal.mode is InteractionMode.IDLE:
-        hint = "G=move  R=rotate  S=scale  N=new  Del=delete  Tab=cycle  A=all  Z=heatmap"
-        cv2.putText(frame, hint, (sw // 2 - 340, sh - 10),
+    # key hint bar
+    if not modal.active:
+        hint = "Hold G=move  Hold R=rotate  Hold S=scale  (combine freely)  N=new  Del=delete  Tab  A  Z"
+        cv2.putText(frame, hint, (sw // 2 - 420, sh - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
     else:
-        hint = "X/Y=lock axis   Enter/Pinch=confirm   Esc/Palm=cancel"
+        hint = "X/Y=axis lock   release key=remove op   Esc=cancel all"
         cv2.putText(frame, hint, (sw // 2 - 240, sh - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
 
@@ -361,10 +382,56 @@ def _get_right_hand_gesture(hands_result: "HandsResult | None") -> GestureClass:
     return GestureClass.UNKNOWN
 
 
+_HOLD_KEYS = {ord("g"): InteractionMode.MOVE,
+              ord("r"): InteractionMode.ROTATE,
+              ord("s"): InteractionMode.SCALE}
+
+# waitKey(1) only delivers one keycode per frame.  When two keys are held
+# simultaneously the OS alternates between their key-repeat events, so each
+# key is "absent" for several frames while the other fires.  Per-key absence
+# counters therefore can't work — whichever key isn't reported this frame
+# immediately starts counting toward release.
+#
+# Solution: one shared absence counter for the whole modal.  Any hold-key
+# seen this frame resets it.  The modal commits only when NO hold-key has
+# been seen for _HOLD_RELEASE_FRAMES consecutive frames — i.e. all keys are
+# genuinely released.  Adding a second key (G then R) is still additive; the
+# modal just doesn't commit until everything is released.
+_HOLD_RELEASE_FRAMES = 15
+
+
+def _check_hold_release(
+    key: int,
+    modal: ModalState,
+    squares: list,
+    selected_indices: "list[int] | None",
+    held_key_ref: "list[int]",   # [absence_frame_count]
+) -> None:
+    """
+    Called once per frame BEFORE key dispatch.
+
+    Resets the shared absence counter whenever any hold-key is seen.
+    Commits the modal after _HOLD_RELEASE_FRAMES consecutive frames with
+    no hold-key — meaning all held keys have been released.
+    """
+    if not modal.active:
+        held_key_ref[0] = 0
+        return
+
+    raw = key & 0xFF
+    if raw in _HOLD_KEYS:
+        held_key_ref[0] = 0          # at least one key still held
+    else:
+        held_key_ref[0] += 1
+        if held_key_ref[0] >= _HOLD_RELEASE_FRAMES:
+            modal.commit()
+            held_key_ref[0] = 0
+            if selected_indices is not None:
+                selected_indices.clear()
+
+
 def _handle_key_and_gesture(
     key: int,
-    gesture: GestureClass,
-    prev_gesture: GestureClass,
     modal: ModalState,
     squares: list,
     pinch: "PinchTransform | None",
@@ -374,53 +441,35 @@ def _handle_key_and_gesture(
     *,
     heatmap_buf: "np.ndarray | None" = None,
     prev_gaze: "list | None" = None,
-    heatmap_alpha_ref: "list[float] | None" = None,  # [alpha] mutable box
-    selected_indices: "list[int] | None" = None,      # mutable box: [idx] or []
+    heatmap_alpha_ref: "list[float] | None" = None,
+    selected_indices: "list[int] | None" = None,
+    held_key_ref: "list[int] | None" = None,   # [absence_frame_count]
 ) -> None:
     """
-    Mutates *modal*, *squares*, and optional mutable boxes in-place.
-    Handles both keyboard (Blender shortcuts) and gesture edge-triggers.
+    Keyboard-only interaction handler.
+
+    G / R / S are hold-to-operate and additive: press G then R while G is
+    held to move+rotate simultaneously.  The modal commits when ALL hold-keys
+    are released (shared absence counter).  Esc cancels and reverts.
     """
-    # ── gesture edge-triggers (only on gesture *change*) ─────────────────────
-    gesture_just_changed = gesture is not prev_gesture
+    raw = key & 0xFF
 
-    # Fist → enter MOVE (same as pressing G)
-    if (gesture_just_changed and gesture is GestureClass.FIST
-            and not modal.active and pinch is not None):
-        idx = _select_target(pinch, squares, selected_indices, sw, sh)
-        if idx is not None:
-            _modal_enter(modal, InteractionMode.MOVE, idx, pinch, squares)
+    # ── hold-to-operate: G / R / S (additive) ────────────────────────────────
+    if raw in _HOLD_KEYS and pinch is not None:
+        op = _HOLD_KEYS[raw]
+        if op not in modal.ops:
+            # new key — add its op; lock onto square on first key only
+            if not modal.active:
+                idx = _select_target(pinch, squares, selected_indices, sw, sh)
+            else:
+                idx = modal.square_idx
+            if idx is not None and idx < len(squares):
+                modal.add_op(op, idx, pinch, squares[idx])
+                if held_key_ref is not None:
+                    held_key_ref[0] = 0
 
-    # Pinch → confirm active operation (same as Enter)
-    if (gesture_just_changed and gesture is GestureClass.PINCH and modal.active):
-        modal.commit()
-        if selected_indices is not None:
-            selected_indices.clear()
-
-    # Open palm → cancel active operation (same as Esc)
-    if (gesture_just_changed and gesture is GestureClass.OPEN_PALM and modal.active):
-        modal.cancel(squares)
-        if selected_indices is not None:
-            selected_indices.clear()
-
-    # ── keyboard shortcuts ────────────────────────────────────────────────────
-    if key == ord("g") and not modal.active and pinch is not None:
-        idx = _select_target(pinch, squares, selected_indices, sw, sh)
-        if idx is not None:
-            _modal_enter(modal, InteractionMode.MOVE, idx, pinch, squares)
-
-    elif key == ord("r") and not modal.active and pinch is not None:
-        idx = _select_target(pinch, squares, selected_indices, sw, sh)
-        if idx is not None:
-            _modal_enter(modal, InteractionMode.ROTATE, idx, pinch, squares)
-
-    elif key == ord("s") and not modal.active and pinch is not None:
-        idx = _select_target(pinch, squares, selected_indices, sw, sh)
-        if idx is not None:
-            _modal_enter(modal, InteractionMode.SCALE, idx, pinch, squares)
-
+    # ── axis constraint ───────────────────────────────────────────────────────
     elif key == ord("x") and modal.active:
-        # toggle X-axis lock; if pressed again → delete when idle handled below
         modal.axis = (AxisConstraint.NONE
                       if modal.axis is AxisConstraint.X else AxisConstraint.X)
 
@@ -428,15 +477,12 @@ def _handle_key_and_gesture(
         modal.axis = (AxisConstraint.NONE
                       if modal.axis is AxisConstraint.Y else AxisConstraint.Y)
 
-    elif key in (13, ord("\r")) and modal.active:   # Enter
-        modal.commit()
-        if selected_indices is not None:
-            selected_indices.clear()
-
-    elif key == 27 and modal.active:               # Esc  — cancel only if active
+    elif key == 27 and modal.active:               # Esc — cancel all ops, revert
         modal.cancel(squares)
         if selected_indices is not None:
             selected_indices.clear()
+        if held_key_ref is not None:
+            held_key_ref[0] = 0
 
     elif key == ord("a"):                          # select / deselect all
         if selected_indices is not None:
@@ -447,7 +493,6 @@ def _handle_key_and_gesture(
                 selected_indices.extend(range(len(squares)))
 
     elif key in (127, 8) and not modal.active:     # Delete / Backspace
-        # delete selected squares (reverse order to keep indices valid)
         if selected_indices:
             for i in sorted(selected_indices, reverse=True):
                 if 0 <= i < len(squares):
@@ -462,7 +507,8 @@ def _handle_key_and_gesture(
         from .hands import SquareObject
         cx = gaze_xy[0] if gaze_xy else sw // 2
         cy = gaze_xy[1] if gaze_xy else sh // 2
-        squares.append(SquareObject(cx=cx, cy=cy, size=sh * 0.15, angle_deg=0.0))
+        squares.append(SquareObject(
+            cx=cx, cy=cy, size=sh * 0.15, angle_deg=0.0))
 
     elif key == ord("\t") and not modal.active:    # Tab — cycle selection
         if selected_indices is not None and squares:
@@ -474,35 +520,22 @@ def _handle_key_and_gesture(
     elif key == ord("z") and heatmap_alpha_ref is not None:  # cycle heatmap opacity
         steps = [0.0, 0.3, 0.55, 0.8]
         cur = heatmap_alpha_ref[0]
-        # find next step
         diffs = [abs(cur - s) for s in steps]
         cur_idx = diffs.index(min(diffs))
         heatmap_alpha_ref[0] = steps[(cur_idx + 1) % len(steps)]
 
 
 def _select_target(
-    pinch: "PinchTransform",
+    pinch: PinchTransform,
     squares: list,
     selected_indices: "list[int] | None",
     sw: int,
     sh: int,
 ) -> "int | None":
-    """Return the square index to operate on: hovered, or first selected."""
+    """Return the square index to operate on: first selected, else nearest to pinch."""
     if selected_indices:
         return selected_indices[0]
     return pick_square(pinch, squares, screen_h=sh)
-
-
-def _modal_enter(
-    modal: ModalState,
-    mode: InteractionMode,
-    idx: int,
-    pinch: "PinchTransform",
-    squares: list,
-) -> None:
-    from .hands import SquareObject
-    sq = squares[idx]
-    modal.enter(mode, idx, pinch, sq)
 
 
 # ── glasses-cam thread ────────────────────────────────────────────────────────
@@ -564,8 +597,8 @@ def _launcher() -> tuple[str, Monitor]:
     root.resizable(False, False)
 
     title_font = tkfont.Font(family="Helvetica", size=22, weight="bold")
-    btn_font   = tkfont.Font(family="Helvetica", size=14)
-    sub_font   = tkfont.Font(family="Helvetica", size=10)
+    btn_font = tkfont.Font(family="Helvetica", size=14)
+    sub_font = tkfont.Font(family="Helvetica", size=10)
     label_font = tkfont.Font(family="Helvetica", size=11, weight="bold")
 
     tk.Label(root, text="handy-io", font=title_font,
@@ -583,7 +616,7 @@ def _launcher() -> tuple[str, Monitor]:
     screen_frame.pack(padx=40, pady=(4, 20), fill="x")
 
     CANVAS_H = 64
-    TOTAL_W  = 380
+    TOTAL_W = 380
 
     # Draw a mini desktop map showing monitor layout
     # Compute bounding box of all monitors
@@ -640,7 +673,8 @@ def _launcher() -> tuple[str, Monitor]:
     tk.Label(root, text="MODE", font=label_font,
              bg="#111", fg="#aaa").pack(anchor="w", padx=40)
 
-    btn_cfg = dict(font=btn_font, width=28, pady=12, relief="flat", cursor="hand2")
+    btn_cfg = dict(font=btn_font, width=28, pady=12,
+                   relief="flat", cursor="hand2")
 
     def _pick(mode: str) -> None:
         mon = monitors[selected_monitor.get()]
@@ -680,7 +714,8 @@ def _run_hands_only(monitor: Monitor) -> None:
     hand_thread = InferenceThread(hand_model, "hand-inference")
     hand_thread.start()
 
-    print("handy-io  [hands only]  |  q=quit  h=toggle skeleton  ?=cheat-sheet")
+    print(
+        "handy-io  [hands only]  |  q=quit  h=toggle skeleton  ?=cheat-sheet")
     print("  G=move  R=rotate  S=scale  N=new  Del=delete  Tab=cycle  A=all")
     print("  Fist=grab  Pinch=confirm  Palm=cancel")
 
@@ -688,7 +723,8 @@ def _run_hands_only(monitor: Monitor) -> None:
     squares = make_default_squares(sw, sh)
     modal = ModalState()
     selected_indices: list[int] = []
-    prev_gesture = GestureClass.UNKNOWN
+    held_key_ref: list[int] = [0]   # [absence_frame_count]
+    pinch_ema = PinchEMA(alpha=0.55)
     cheat = CheatSheet()
 
     _fps_t0 = time.monotonic()
@@ -702,7 +738,8 @@ def _run_hands_only(monitor: Monitor) -> None:
 
             display = cv2.flip(cv2.resize(frame_bgr, (sw, sh)), 1)
 
-            pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+            raw_pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+            pt = pinch_ema.update(raw_pt)
             gesture = _get_right_hand_gesture(hands_result)
 
             # apply continuous modal transform
@@ -735,6 +772,9 @@ def _run_hands_only(monitor: Monitor) -> None:
             cv2.imshow(WIN_NAME, display)
             key = cv2.waitKey(1) & 0xFF
 
+            _check_hold_release(key, modal, squares,
+                                selected_indices, held_key_ref)
+
             if key in (ord("q"),):
                 break
             elif key == 27 and not modal.active and not cheat.open:
@@ -745,11 +785,11 @@ def _run_hands_only(monitor: Monitor) -> None:
                 show_hands = not show_hands
             else:
                 _handle_key_and_gesture(
-                    key, gesture, prev_gesture, modal, squares, pt, sw, sh,
+                    key, modal, squares, pt, sw, sh,
                     selected_indices=selected_indices,
+                    held_key_ref=held_key_ref,
                 )
 
-            prev_gesture = gesture
     finally:
         hand_thread.stop()
         cap.release()
@@ -761,21 +801,24 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
     gaze.init_focal_px(cap)
 
     face_model = _try_gpu(
-        lambda use_gpu: FaceMesh(output_face_transform=_NEED_FACE_TRANSFORM, use_gpu=use_gpu),
+        lambda use_gpu: FaceMesh(
+            output_face_transform=_NEED_FACE_TRANSFORM, use_gpu=use_gpu),
         "face",
     ) if USE_GPU else FaceMesh(output_face_transform=_NEED_FACE_TRANSFORM, use_gpu=False)
 
     hand_model: HandTracker | None = None
     if SHOW_HANDS:
         hand_model = (
-            _try_gpu(lambda use_gpu: HandTracker(max_hands=2, use_gpu=use_gpu), "hands")
+            _try_gpu(lambda use_gpu: HandTracker(
+                max_hands=2, use_gpu=use_gpu), "hands")
             if USE_GPU else HandTracker(max_hands=2, use_gpu=False)
         )
 
     # ── single shared fullscreen window ──────────────────────────────────────
     sw, sh = monitor.w, monitor.h
     _make_fullscreen_window(WIN_NAME, monitor)
-    print(f"handy-io  |  mode={MODE}  screen={sw}×{sh}  display={monitor.label}")
+    print(
+        f"handy-io  |  mode={MODE}  screen={sw}×{sh}  display={monitor.label}")
 
     heatmap = GazeHeatmap(sw, sh, sigma=SIGMA, decay=DECAY)
     prev_gaze: list[np.ndarray] = []
@@ -796,7 +839,8 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
 
     # ── calibration phase (synchronous — models called directly on main thread) ─
     print("Running calibration …")
-    calib_matrix, calib_poly_degree = _run_calibration(cap, face_model, (sw, sh))
+    calib_matrix, calib_poly_degree = _run_calibration(
+        cap, face_model, (sw, sh))
     if calib_matrix is None:
         print("[calibration] not enough points — falling back to uncalibrated mode.")
 
@@ -817,8 +861,9 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
     squares = make_default_squares(sw, sh)
     modal = ModalState()
     selected_indices: list[int] = []
-    prev_gesture = GestureClass.UNKNOWN
-    heatmap_alpha = [ALPHA]   # mutable box so _handle_key_and_gesture can update it
+    heatmap_alpha = [ALPHA]
+    held_key_ref: list[int] = [0]   # [absence_frame_count]
+    pinch_ema = PinchEMA(alpha=0.55)
     cheat = CheatSheet()
 
     # FPS tracking
@@ -880,7 +925,8 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
                 for hand in hands_result.hands:
                     if hand.handedness != "Right":
                         continue
-                    tip_xy = hand.landmarks[FINGERTIPS, :2]  # (5, 2) normalised
+                    # (5, 2) normalised
+                    tip_xy = hand.landmarks[FINGERTIPS, :2]
                     pts = gaze.finger_screen_points(
                         gl, tip_xy, calib_matrix, calib_poly_degree)
                     finger_occlusion.append((pts, FINGERTIPS))
@@ -889,7 +935,8 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             # 1. Mirror the camera feed so the user sees a natural reflection.
             display = cv2.flip(cv2.resize(frame_bgr, (sw, sh)), 1)
 
-            pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+            raw_pt = pinch_transform(hands_result, sw, sh) if hands_result else None
+            pt = pinch_ema.update(raw_pt)
             gesture = _get_right_hand_gesture(hands_result)
 
             # 2. Apply continuous modal transform, then draw squares.
@@ -961,6 +1008,10 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
             cv2.imshow(WIN_NAME, display)
 
             key = cv2.waitKey(1) & 0xFF
+
+            _check_hold_release(key, modal, squares,
+                                selected_indices, held_key_ref)
+
             if key in (ord("q"),):
                 break
             elif key == 27 and not modal.active and not cheat.open:
@@ -974,51 +1025,27 @@ def _run_gaze_and_hands(monitor: Monitor) -> None:
                 show_glasses_debug = not show_glasses_debug
             elif key == ord("h"):
                 show_hands = not show_hands
-            elif key == ord("r") and modal.active:
-                # R while in a modal mode → axis/rotate handled by _handle_key_and_gesture
-                _handle_key_and_gesture(
-                    key, gesture, prev_gesture, modal, squares, pt, sw, sh,
-                    gaze_xy=(gx, gy),
-                    heatmap_buf=heatmap._buf,
-                    prev_gaze=prev_gaze,
-                    heatmap_alpha_ref=heatmap_alpha,
-                    selected_indices=selected_indices,
-                )
-            elif key == ord("r") and not modal.active:
-                # Ctrl+R style recalibrate: only when idle AND 'r' pressed
-                # (conflicts with rotate — use Ctrl+R conceptually; plain R enters rotate)
-                # To recalibrate, the user must first ensure no modal is active.
-                # We distinguish: if pinch is present → rotate, else → recalibrate.
-                if pt is not None:
-                    _handle_key_and_gesture(
-                        key, gesture, prev_gesture, modal, squares, pt, sw, sh,
-                        gaze_xy=(gx, gy),
-                        heatmap_buf=heatmap._buf,
-                        prev_gaze=prev_gaze,
-                        heatmap_alpha_ref=heatmap_alpha,
-                        selected_indices=selected_indices,
-                    )
-                else:
-                    prev_gaze.clear()
-                    heatmap._buf[:] = 0
-                    face_thread.stop()
-                    face_thread.join(timeout=2.0)
-                    calib_matrix, calib_poly_degree = _run_calibration(
-                        cap, face_model, (sw, sh))
-                    face_thread = InferenceThread(face_model, "face-inference")
-                    face_thread.start()
-                    _make_fullscreen_window(WIN_NAME, monitor)
+            elif key == ord("r") and not modal.active and pt is None:
+                # R with no hand visible → recalibrate
+                prev_gaze.clear()
+                heatmap._buf[:] = 0
+                face_thread.stop()
+                face_thread.join(timeout=2.0)
+                calib_matrix, calib_poly_degree = _run_calibration(
+                    cap, face_model, (sw, sh))
+                face_thread = InferenceThread(face_model, "face-inference")
+                face_thread.start()
+                _make_fullscreen_window(WIN_NAME, monitor)
             else:
                 _handle_key_and_gesture(
-                    key, gesture, prev_gesture, modal, squares, pt, sw, sh,
+                    key, modal, squares, pt, sw, sh,
                     gaze_xy=(gx, gy),
                     heatmap_buf=heatmap._buf,
                     prev_gaze=prev_gaze,
                     heatmap_alpha_ref=heatmap_alpha,
                     selected_indices=selected_indices,
+                    held_key_ref=held_key_ref,
                 )
-
-            prev_gesture = gesture
 
     finally:
         face_thread.stop()

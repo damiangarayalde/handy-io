@@ -169,10 +169,10 @@ def classify_gesture(hand: HandResult) -> GestureClass:
 # ── modal interaction state machine ──────────────────────────────────────────
 
 class InteractionMode(Enum):
-    IDLE    = "IDLE"
-    MOVE    = "MOVE"    # G — translate only
-    ROTATE  = "ROTATE"  # R — rotate only
-    SCALE   = "SCALE"   # S — scale only
+    """Individual transform operations.  Multiple can be active simultaneously."""
+    MOVE   = "MOVE"    # G — translate
+    ROTATE = "ROTATE"  # R — rotate
+    SCALE  = "SCALE"   # S — scale
 
 
 class AxisConstraint(Enum):
@@ -184,61 +184,82 @@ class AxisConstraint(Enum):
 @dataclass
 class ModalState:
     """
-    Blender-style modal operation state.
+    Modal transform state supporting combined operations.
+
+    *ops* is a frozenset of active InteractionMode values.
+    Empty frozenset = IDLE.  Keys are additive: holding G then R gives
+    ops={MOVE, ROTATE}, applying both transforms simultaneously.
 
     Lifecycle:
-      IDLE ──(G/fist)──► MOVE ──(Enter/pinch)──► IDLE (commit)
-                              └─(Esc/palm)──────► IDLE (revert)
-      IDLE ──(R)───────► ROTATE  (same confirm/cancel)
-      IDLE ──(S)───────► SCALE   (same confirm/cancel)
-
-    Axis constraint (X/Y keys while in any non-IDLE mode):
-      locks the operation to one screen axis.
+      ops={}  ─(hold G)──► {MOVE}
+              ─(hold G+R)─► {MOVE, ROTATE}
+      any ops ─(release)──► {} (commit)
+              ─(Esc)──────► {} (revert)
     """
-    mode: InteractionMode = InteractionMode.IDLE
-    axis: AxisConstraint  = AxisConstraint.NONE
+    ops:  frozenset = field(default_factory=frozenset)
+    axis: AxisConstraint = AxisConstraint.NONE
 
-    # snapshot of the grabbed square at the moment the mode was entered
-    square_idx:   int   = -1
-    grab_cx:      float = 0.0
-    grab_cy:      float = 0.0
-    grab_size:    float = 0.0
-    grab_angle:   float = 0.0
-    sq_cx:        float = 0.0
-    sq_cy:        float = 0.0
-    sq_size:      float = 0.0
-    sq_angle:     float = 0.0
+    square_idx: int   = -1
+    grab_cx:    float = 0.0
+    grab_cy:    float = 0.0
+    grab_size:  float = 0.0
+    grab_angle: float = 0.0
+    sq_cx:      float = 0.0
+    sq_cy:      float = 0.0
+    sq_size:    float = 0.0
+    sq_angle:   float = 0.0
 
-    # whether a revert is pending (set on cancel before mode returns to IDLE)
     _revert: bool = field(default=False, repr=False)
 
     @property
     def active(self) -> bool:
-        return self.mode is not InteractionMode.IDLE
+        return bool(self.ops)
 
-    def enter(
+    # kept for HUD / legacy callers that check .mode
+    @property
+    def mode(self) -> "InteractionMode | None":
+        if not self.ops:
+            return None
+        # return the "primary" op for display purposes (priority: MOVE > ROTATE > SCALE)
+        for m in (InteractionMode.MOVE, InteractionMode.ROTATE, InteractionMode.SCALE):
+            if m in self.ops:
+                return m
+        return None
+
+    def add_op(
         self,
-        mode: InteractionMode,
+        op: InteractionMode,
         square_idx: int,
         pinch: "PinchTransform",
         sq: "SquareObject",
     ) -> None:
-        self.mode        = mode
-        self.axis        = AxisConstraint.NONE
-        self.square_idx  = square_idx
-        self.grab_cx     = float(pinch.cx)
-        self.grab_cy     = float(pinch.cy)
-        self.grab_size   = float(pinch.size)
-        self.grab_angle  = float(pinch.angle_deg)
-        self.sq_cx       = sq.cx
-        self.sq_cy       = sq.cy
-        self.sq_size     = sq.size
-        self.sq_angle    = sq.angle_deg
-        self._revert     = False
+        """Add an operation, snapshotting the square if this is the first op."""
+        if not self.ops:
+            # first op — lock onto this square and snapshot
+            self.square_idx = square_idx
+            self.grab_cx    = float(pinch.cx)
+            self.grab_cy    = float(pinch.cy)
+            self.grab_size  = float(pinch.size)
+            self.grab_angle = float(pinch.angle_deg)
+            self.sq_cx      = sq.cx
+            self.sq_cy      = sq.cy
+            self.sq_size    = sq.size
+            self.sq_angle   = sq.angle_deg
+            self.axis       = AxisConstraint.NONE
+            self._revert    = False
+        elif square_idx != self.square_idx:
+            # second key pressed but cursor drifted — keep existing target
+            pass
+        self.ops = self.ops | frozenset({op})
+
+    def remove_op(self, op: InteractionMode) -> None:
+        """Remove one operation.  When ops becomes empty, commit implicitly."""
+        self.ops = self.ops - frozenset({op})
+        if not self.ops:
+            self._reset()
 
     def cancel(self, squares: "list[SquareObject]") -> None:
-        """Revert the grabbed square to its snapshot and return to IDLE."""
-        if self.square_idx >= 0 and self.square_idx < len(squares):
+        if 0 <= self.square_idx < len(squares):
             sq = squares[self.square_idx]
             sq.cx        = self.sq_cx
             sq.cy        = self.sq_cy
@@ -247,24 +268,23 @@ class ModalState:
         self._reset()
 
     def commit(self) -> None:
-        """Accept the current transform and return to IDLE."""
         self._reset()
 
     def _reset(self) -> None:
-        self.mode       = InteractionMode.IDLE
+        self.ops        = frozenset()
         self.axis       = AxisConstraint.NONE
         self.square_idx = -1
         self._revert    = False
 
     def apply(self, pinch: "PinchTransform", squares: "list[SquareObject]") -> None:
-        """Drive the grabbed square transform from the current pinch, respecting axis lock."""
+        """Apply all active operations to the locked square."""
         if not self.active or self.square_idx < 0:
             return
         sq = squares[self.square_idx]
-        dcx = pinch.cx - self.grab_cx
-        dcy = pinch.cy - self.grab_cy
 
-        if self.mode is InteractionMode.MOVE:
+        if InteractionMode.MOVE in self.ops:
+            dcx = pinch.cx - self.grab_cx
+            dcy = pinch.cy - self.grab_cy
             if self.axis is AxisConstraint.X:
                 dcy = 0.0
             elif self.axis is AxisConstraint.Y:
@@ -272,10 +292,10 @@ class ModalState:
             sq.cx = self.sq_cx + dcx
             sq.cy = self.sq_cy + dcy
 
-        elif self.mode is InteractionMode.ROTATE:
+        if InteractionMode.ROTATE in self.ops:
             sq.angle_deg = self.sq_angle + (pinch.angle_deg - self.grab_angle)
 
-        elif self.mode is InteractionMode.SCALE:
+        if InteractionMode.SCALE in self.ops:
             if self.grab_size > 0:
                 sq.size = self.sq_size * (pinch.size / self.grab_size)
 
@@ -461,6 +481,57 @@ def make_default_squares(screen_w: int, screen_h: int) -> list[SquareObject]:
         )
         for (x, y), c in zip(positions, colors)
     ]
+
+
+class PinchEMA:
+    """
+    Exponential moving average filter for PinchTransform values.
+
+    alpha=1.0 → no smoothing (raw values pass through).
+    alpha=0.3 → heavy smoothing (slow to follow fast movements).
+    Typical sweet spot: 0.5–0.7.
+
+    Call update(pt) each frame.  Returns None until the first real value
+    arrives, then always returns a smoothed PinchTransform.
+    """
+
+    def __init__(self, alpha: float = 0.6) -> None:
+        self.alpha = alpha
+        self._cx:    float | None = None
+        self._cy:    float | None = None
+        self._size:  float | None = None
+        self._angle: float | None = None
+
+    def reset(self) -> None:
+        self._cx = self._cy = self._size = self._angle = None
+
+    def update(self, pt: PinchTransform | None) -> PinchTransform | None:
+        if pt is None:
+            # hand lost — reset so next appearance snaps to position immediately
+            self.reset()
+            return None
+        a = self.alpha
+        if self._cx is None:
+            # first frame — snap to raw value with no blending
+            self._cx    = float(pt.cx)
+            self._cy    = float(pt.cy)
+            self._size  = float(pt.size)
+            self._angle = float(pt.angle_deg)
+        else:
+            self._cx    = a * pt.cx    + (1 - a) * self._cx
+            self._cy    = a * pt.cy    + (1 - a) * self._cy
+            self._size  = a * pt.size  + (1 - a) * self._size
+            # angle needs circular blending to avoid ±180° wrap-around jumps
+            da = pt.angle_deg - self._angle
+            if da >  180: da -= 360
+            if da < -180: da += 360
+            self._angle = self._angle + a * da
+        return PinchTransform(
+            cx=int(self._cx),
+            cy=int(self._cy),
+            size=int(self._size),
+            angle_deg=self._angle,
+        )
 
 
 def pinch_transform(

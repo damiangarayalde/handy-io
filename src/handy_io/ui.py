@@ -59,12 +59,11 @@ class Section:
 
 _SECTIONS: list[Section] = [
     Section("TRANSFORM", [
-        Entry("G",        "Move object",        "Hover your pinch over an object and press G to enter Move mode.  Drag to reposition."),
-        Entry("R",        "Rotate object",       "Press R to enter Rotate mode.  Twist your pinch hand to spin the object."),
-        Entry("S",        "Scale object",        "Press S to enter Scale mode.  Spread or close your thumb-index gap to resize."),
-        Entry("X / Y",    "Lock axis",           "While in Move mode, press X to constrain motion to horizontal, Y to vertical."),
-        Entry("Enter",    "Confirm",             "Press Enter (or Pinch gesture) to commit the current transform and exit the mode."),
-        Entry("Esc",      "Cancel",              "Press Esc (or Open Palm gesture) to revert to the state before the transform began."),
+        Entry("Hold G",   "Move object",        "Hold G while your pinch is near an object — it follows your hand.  Release G to commit."),
+        Entry("Hold R",   "Rotate object",       "Hold R and twist your pinch hand.  Release R to lock in the new angle."),
+        Entry("Hold S",   "Scale object",        "Hold S and spread or close your thumb-index gap.  Release S to set the size."),
+        Entry("X / Y",    "Lock axis",           "While holding G, tap X to constrain motion horizontally, Y to constrain vertically."),
+        Entry("Esc",      "Cancel",              "Press Esc (or Open Palm gesture) while holding a key to revert to the original transform."),
     ]),
     Section("SELECTION", [
         Entry("Tab",      "Cycle objects",       "Tab steps through each object in order, highlighting it for the next operation."),
